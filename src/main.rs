@@ -12,11 +12,18 @@ const HIDPP_LONG_MESSAGE: u8 = 0x11;
 const HIDPP_LONG_MESSAGE_LENGTH: usize = 20;
 const HIDPP_DEVICE_RECEIVER: u8 = 0xff;
 
+const I3_STATUS_INTERVAL: Duration = Duration::from_millis(500);
+const PULSE_CARD: &str = "alsa_card.usb-Logitech_G935_Gaming_Headset-00";
+const PULSE_PROFILE: &str = "output:analog-stereo+input:mono-fallback";
+
 #[derive(Subcommand, PartialEq, Eq, Debug)]
 enum Command {
     GetBatteryPercentage,
     GetBatteryVoltage,
-    GetI3Status,
+    GetI3Status {
+        #[arg(long)]
+        update_pulseaudio: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -89,9 +96,7 @@ fn get_battery_voltage() -> HidResult<(u16, bool)> {
     Ok((voltage, charging))
 }
 
-fn print_i3_status() -> HidResult<()> {
-    let (voltage, charging) = get_battery_voltage()?;
-    let percentage = estimate_battery_level(voltage);
+fn get_i3_status(percentage: f32, charging: bool) -> String {
     let state = if charging {
         if percentage >= 100.0 {
             "Good"
@@ -122,20 +127,43 @@ fn print_i3_status() -> HidResult<()> {
     } else {
         "headset"
     };
-    println!("{{\"state\":\"{state}\",\"text\":\"{text}\",\"icon\":\"{icon}\"}}");
-    Ok(())
+    format!("{{\"state\":\"{state}\",\"text\":\"{text}\",\"icon\":\"{icon}\"}}")
+}
+
+fn pulse_set_card_profile(card: &str, profile: &str) {
+    std::process::Command::new("pactl")
+        .arg("set-card-profile")
+        .arg(card)
+        .arg(profile)
+        .spawn()
+        .unwrap();
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if cli.command == Command::GetI3Status {
+    if let Command::GetI3Status { update_pulseaudio } = cli.command {
+        let mut last_connected = true;
         loop {
-            match print_i3_status() {
-                Err(_) => println!("{{\"text\":\"\"}}"),
-                _ => {}
+            let Ok((voltage, charging)) = get_battery_voltage() else {
+                println!("{{\"text\":\"\"}}");
+                sleep(I3_STATUS_INTERVAL);
+                continue;
+            };
+            let percentage = estimate_battery_level(voltage);
+            println!("{}", get_i3_status(percentage, charging));
+
+            if update_pulseaudio {
+                let connected = percentage >= 0.0;
+                if connected && !last_connected {
+                    pulse_set_card_profile(PULSE_CARD, PULSE_PROFILE);
+                } else if !connected && last_connected {
+                    pulse_set_card_profile(PULSE_CARD, "off");
+                }
+                last_connected = connected;
             }
-            sleep(Duration::from_millis(500));
+
+            sleep(I3_STATUS_INTERVAL);
         }
     }
 
