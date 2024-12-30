@@ -1,6 +1,6 @@
 //! Much of this was ported from [HeadsetControl](https://github.com/Sapd/HeadsetControl)
 
-use std::process::exit;
+use std::{process::exit, thread::sleep, time::Duration};
 
 use clap::{Parser, Subcommand};
 use hidapi::{HidApi, HidDevice};
@@ -93,13 +93,18 @@ fn get_battery_voltage() -> (u16, bool) {
     (voltage, charging)
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn print_i3_status() {
     let (voltage, charging) = get_battery_voltage();
     let percentage = estimate_battery_level(voltage);
-
-    if cli.command == Command::GetI3Status {
-        let state = if percentage < 0.0 {
+    let state = if charging {
+        if percentage >= 100.0 {
+            "Good"
+        } else {
+            "info"
+        }
+    } else {
+        if percentage < 0.0 {
+            // Disconnected
             "Idle"
         } else if percentage < 5.0 {
             "Critical"
@@ -107,16 +112,35 @@ fn main() {
             "Warning"
         } else {
             "Info"
-        };
-        let text = format!("{}%", percentage);
-        let text = if percentage < 0.0 {
-            "Disconnected"
-        } else {
-            &text
-        };
-        println!("{{\"state\":\"{state}\",\"text\":\"{text}\",\"icon\":\"headset\"}}");
-        return;
+        }
+    };
+
+    let text = format!("{:.0}%", percentage);
+    let text = if percentage < 0.0 {
+        "Disconnected"
+    } else {
+        &text
+    };
+    let icon = if charging {
+        "headset_charging"
+    } else {
+        "headset"
+    };
+    println!("{{\"state\":\"{state}\",\"text\":\"{text}\",\"icon\":\"{icon}\"}}");
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    if cli.command == Command::GetI3Status {
+        loop {
+            print_i3_status();
+            sleep(Duration::from_millis(500));
+        }
     }
+
+    let (voltage, charging) = get_battery_voltage();
+    let percentage = estimate_battery_level(voltage);
 
     // TODO: find a bettery way to check this
     if percentage < 0.0 {
@@ -126,7 +150,7 @@ fn main() {
     match cli.command {
         Command::GetBatteryVoltage => println!("{}", voltage),
         Command::GetBatteryPercentage => println!("{}", percentage),
-        _ => unreachable!()
+        _ => unreachable!(),
     }
     println!("Charging: {}", charging as u8);
 }
