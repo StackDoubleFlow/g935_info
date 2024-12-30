@@ -3,7 +3,7 @@
 use std::{process::exit, thread::sleep, time::Duration};
 
 use clap::{Parser, Subcommand};
-use hidapi::{HidApi, HidDevice};
+use hidapi::{HidApi, HidDevice, HidResult};
 
 const VID: u16 = 0x046d;
 const PID: u16 = 0x0a87;
@@ -40,17 +40,13 @@ fn estimate_battery_level(voltage: u16) -> f32 {
         + 736315.3077118985
 }
 
-fn get_device() -> HidDevice {
-    let api = HidApi::new().unwrap();
-    let Ok(device) = api.open(VID, PID) else {
-        eprintln!("Could not find G935 Gaming Headset");
-        exit(1);
-    };
-    device
+fn get_device() -> HidResult<HidDevice> {
+    let api = HidApi::new()?;
+    api.open(VID, PID)
 }
 
-fn get_battery_voltage() -> (u16, bool) {
-    let device = get_device();
+fn get_battery_voltage() -> HidResult<(u16, bool)> {
+    let device = get_device()?;
 
     let data_request: [u8; HIDPP_LONG_MESSAGE_LENGTH] = [
         HIDPP_LONG_MESSAGE,
@@ -75,10 +71,10 @@ fn get_battery_voltage() -> (u16, bool) {
         0x00,
     ];
 
-    device.write(&data_request).unwrap();
+    device.write(&data_request)?;
 
     let mut data_read = [0; 7];
-    let bytes_read = device.read_timeout(&mut data_read, 5000).unwrap();
+    let bytes_read = device.read_timeout(&mut data_read, 5000)?;
     if bytes_read == 0 {
         eprintln!("Device read timed out.");
         exit(1);
@@ -90,11 +86,11 @@ fn get_battery_voltage() -> (u16, bool) {
 
     let voltage = ((data_read[4] as u16) << 8) | data_read[5] as u16;
 
-    (voltage, charging)
+    Ok((voltage, charging))
 }
 
-fn print_i3_status() {
-    let (voltage, charging) = get_battery_voltage();
+fn print_i3_status() -> HidResult<()> {
+    let (voltage, charging) = get_battery_voltage()?;
     let percentage = estimate_battery_level(voltage);
     let state = if charging {
         if percentage >= 100.0 {
@@ -127,6 +123,7 @@ fn print_i3_status() {
         "headset"
     };
     println!("{{\"state\":\"{state}\",\"text\":\"{text}\",\"icon\":\"{icon}\"}}");
+    Ok(())
 }
 
 fn main() {
@@ -134,12 +131,21 @@ fn main() {
 
     if cli.command == Command::GetI3Status {
         loop {
-            print_i3_status();
+            match print_i3_status() {
+                Err(_) => println!("{{\"text\":\"\"}}"),
+                _ => {}
+            }
             sleep(Duration::from_millis(500));
         }
     }
 
-    let (voltage, charging) = get_battery_voltage();
+    let (voltage, charging) = match get_battery_voltage() {
+        Ok(x) => x,
+        Err(err) => {
+            eprintln!("{}", err);
+            exit(1);
+        }
+    };
     let percentage = estimate_battery_level(voltage);
 
     // TODO: find a bettery way to check this
