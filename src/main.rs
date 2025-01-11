@@ -1,16 +1,9 @@
-//! Much of this was ported from [HeadsetControl](https://github.com/Sapd/HeadsetControl)
-
-use std::{process::exit, thread::sleep, time::Duration};
+use std::{fs, path::PathBuf, process::exit, thread::sleep, time::Duration};
 
 use clap::{Parser, Subcommand};
-use hidapi::{HidApi, HidDevice, HidResult};
 
 const VID: u16 = 0x046d;
 const PID: u16 = 0x0a87;
-
-const HIDPP_LONG_MESSAGE: u8 = 0x11;
-const HIDPP_LONG_MESSAGE_LENGTH: usize = 20;
-const HIDPP_DEVICE_RECEIVER: u8 = 0xff;
 
 const I3_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const PULSE_CARD: &str = "alsa_card.usb-Logitech_G935_Gaming_Headset-00";
@@ -32,96 +25,29 @@ struct Cli {
     command: Command,
 }
 
-fn estimate_battery_level(voltage: u16) -> f32 {
-    let voltage = voltage as f32;
-    if voltage <= 3525.0 {
-        return (0.03 * voltage) - 101.0;
-    }
-    if voltage > 4030.0 {
-        return 100.0;
-    }
-    // f(x)=3.7268473047*10^(-9)x^(4)-0.00005605626214573775*x^(3)+0.3156051902814949*x^(2)-788.0937250298629*x+736315.3077118985
-    0.0000000037268473047 * voltage.powf(4.0) - 0.00005605626214573775 * voltage.powf(3.0)
-        + 0.3156051902814949 * voltage.powf(2.0)
-        - 788.0937250298629 * voltage
-        + 736315.3077118985
-}
-
-fn get_device() -> HidResult<HidDevice> {
-    let api = HidApi::new()?;
-    api.open(VID, PID)
-}
-
-fn get_battery_voltage() -> HidResult<(u16, bool)> {
-    let device = get_device()?;
-
-    let data_request: [u8; HIDPP_LONG_MESSAGE_LENGTH] = [
-        HIDPP_LONG_MESSAGE,
-        HIDPP_DEVICE_RECEIVER,
-        0x08,
-        0x0a,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-    ];
-
-    device.write(&data_request)?;
-
-    let mut data_read = [0; 7];
-    let bytes_read = device.read_timeout(&mut data_read, 5000)?;
-    if bytes_read == 0 {
-        eprintln!("Device read timed out.");
-        exit(1);
-    }
-
-    // 6th byte is state; 0x1 for idle, 0x3 for charging
-    let state = data_read[6];
-    let charging = state == 0x03;
-
-    let voltage = ((data_read[4] as u16) << 8) | data_read[5] as u16;
-
-    Ok((voltage, charging))
-}
-
-fn get_i3_status(percentage: f32, charging: bool) -> String {
-    let state = if charging {
-        if percentage >= 100.0 {
-            "Good"
+fn get_i3_status(connected: bool, percentage: u32, charging: bool) -> String {
+    let state = if connected {
+        if charging {
+            if percentage >= 99 {
+                "Good"
+            } else {
+                "info"
+            }
         } else {
-            "info"
+            if percentage <= 5 {
+                "Critical"
+            } else if percentage <= 15 {
+                "Warning"
+            } else {
+                "Info"
+            }
         }
     } else {
-        if percentage < 0.0 {
-            // Disconnected
-            "Idle"
-        } else if percentage < 5.0 {
-            "Critical"
-        } else if percentage < 15.0 {
-            "Warning"
-        } else {
-            "Info"
-        }
+        "Idle"
     };
 
     let text = format!("{:.0}%", percentage);
-    let text = if percentage < 0.0 {
-        "Disconnected"
-    } else {
-        &text
-    };
+    let text = if !connected { "Disconnected" } else { &text };
     let icon = if charging {
         "headset_charging"
     } else {
@@ -139,22 +65,93 @@ fn pulse_set_card_profile(card: &str, profile: &str) {
         .unwrap();
 }
 
+fn get_device_path() -> Option<PathBuf> {
+    for device in rusb::devices().unwrap().iter() {
+        let desc = device.device_descriptor().unwrap();
+        if desc.product_id() == PID && desc.vendor_id() == VID {
+            let port_numbers = device.port_numbers().unwrap();
+            let path = PathBuf::from(format!(
+                "/sys/bus/usb/devices/{}-{}:1.3",
+                device.bus_number(),
+                port_numbers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+                    .join(".")
+            ));
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn get_wireless_status() -> Option<bool> {
+    let device_path = get_device_path()?;
+    Some(
+        match fs::read_to_string(device_path.join("wireless_status"))
+            .unwrap()
+            .trim_end()
+        {
+            "connected" => true,
+            "disconnected" => false,
+            status => panic!("unknown wireless status: {}", status),
+        },
+    )
+}
+
+#[derive(Debug)]
+struct BatteryInfo {
+    charging: bool,
+    percentage: u32,
+    voltage: u32,
+}
+
+fn get_battery() -> Option<BatteryInfo> {
+    for power_supply_dir in fs::read_dir("/sys/class/power_supply").unwrap() {
+        let power_supply_dir = power_supply_dir.unwrap().path();
+        let model_name = fs::read_to_string(power_supply_dir.join("model_name")).unwrap();
+        if model_name.trim_end() == "G935 Gaming Headset" {
+            return Some(BatteryInfo {
+                charging: match fs::read_to_string(power_supply_dir.join("status"))
+                    .unwrap()
+                    .as_str()
+                    .trim_end()
+                {
+                    "Unknown" => return None,
+                    "Discharging" => false,
+                    "Charging" => true,
+                    status => panic!("unknown battery status: {}", status),
+                },
+                voltage: fs::read_to_string(power_supply_dir.join("voltage_now"))
+                    .unwrap()
+                    .trim_end()
+                    .parse()
+                    .unwrap(),
+                percentage: fs::read_to_string(power_supply_dir.join("capacity"))
+                    .unwrap()
+                    .trim_end()
+                    .parse()
+                    .unwrap(),
+            });
+        }
+    }
+
+    None
+}
+
 fn main() {
     let cli = Cli::parse();
 
     if let Command::GetI3Status { update_pulseaudio } = cli.command {
         let mut last_connected = true;
         loop {
-            let Ok((voltage, charging)) = get_battery_voltage() else {
+            let Some(connected) = get_wireless_status() else {
                 println!("{{\"text\":\"\"}}");
                 sleep(I3_STATUS_INTERVAL);
                 continue;
             };
-            let percentage = estimate_battery_level(voltage);
-            println!("{}", get_i3_status(percentage, charging));
-
             if update_pulseaudio {
-                let connected = percentage >= 0.0;
                 if connected && !last_connected {
                     pulse_set_card_profile(PULSE_CARD, PULSE_PROFILE);
                 } else if !connected && last_connected {
@@ -163,28 +160,37 @@ fn main() {
                 last_connected = connected;
             }
 
+            if connected {
+                let battery = get_battery().unwrap();
+                println!(
+                    "{}",
+                    get_i3_status(connected, battery.percentage, battery.charging)
+                );
+            } else {
+                println!("{}", get_i3_status(connected, 0, false));
+            }
+
             sleep(I3_STATUS_INTERVAL);
         }
     }
 
-    let (voltage, charging) = match get_battery_voltage() {
-        Ok(x) => x,
-        Err(err) => {
-            eprintln!("{}", err);
-            exit(1);
-        }
+    let Some(connected) = get_wireless_status() else {
+        eprintln!("usb device not found");
+        exit(1);
     };
-    let percentage = estimate_battery_level(voltage);
+    let Some(battery) = get_battery() else {
+        eprintln!("battery not found");
+        exit(1);
+    };
 
-    // TODO: find a bettery way to check this
-    if percentage < 0.0 {
+    if !connected {
         eprintln!("Wireless connection disconnected.");
         exit(1);
     }
     match cli.command {
-        Command::GetBatteryVoltage => println!("{}", voltage),
-        Command::GetBatteryPercentage => println!("{}", percentage),
+        Command::GetBatteryVoltage => println!("{}", battery.voltage),
+        Command::GetBatteryPercentage => println!("{}", battery.percentage),
         _ => unreachable!(),
     }
-    println!("Charging: {}", charging as u8);
+    println!("Charging: {}", battery.charging as u8);
 }
